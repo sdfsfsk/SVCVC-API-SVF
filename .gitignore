@@ -1,0 +1,20 @@
+runtime/
+cache/*
+downloads/*
+outputs/*
+!cache/.gitkeep
+!downloads/.gitkeep
+!outputs/.gitkeep
+__pycache__/
+*.pyc
+*.part
+PLAN.md
+
+# Reference voices are user-provided data and may contain personal or
+# copyrighted recordings.  Keep only the usage guide in the public repo.
+voice_profiles/*
+!voice_profiles/README.md
+
+# Local test/debug artifacts
+test_*
+*.log

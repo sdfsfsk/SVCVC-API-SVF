@@ -1,0 +1,22 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 6666,
+    "queue_max_size": 8
+  },
+  "soulx": {
+    "base_url": "http://127.0.0.1:7861",
+    "request_timeout_seconds": 9000,
+    "asset_fingerprint_refresh_seconds": 5
+  },
+  "download": {
+    "timeout_seconds": 60,
+    "max_size_mb": 500,
+    "max_files": 100
+  },
+  "cache": {
+    "enabled": true,
+    "random_seed_persistent": false,
+    "max_files": 100
+  }
+}
