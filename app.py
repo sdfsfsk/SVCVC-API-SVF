@@ -19,6 +19,12 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import gradio as gr
 import requests
+from bilibili_source import (
+    download_bilibili_audio,
+    is_bilibili_source,
+    resolve_bilibili_video_url,
+    search_bilibili_videos,
+)
 from gradio_client import Client, handle_file
 
 
@@ -667,6 +673,46 @@ def _resolve_target_audio(
     raise FileNotFoundError(f"找不到目标音频，也无法识别为 HTTP/网易云来源: {source}")
 
 
+def _resolve_bilibili_audio(
+    source: str,
+    status_callback: Callable[[float, str], None] | None = None,
+) -> Path:
+    video_url = resolve_bilibili_video_url(source)
+    key = hashlib.sha256(video_url.encode("utf-8")).hexdigest()[:24]
+    destination = DOWNLOAD_DIR / f"bilibili_{key}.wav"
+    if not destination.is_file() or destination.stat().st_size <= 0:
+        _emit_status(status_callback, 0.0, "正在下载 B 站音频...")
+        downloaded = download_bilibili_audio(video_url, destination, FFMPEG_PATH.parent)
+        if downloaded.resolve() != destination.resolve():
+            downloaded.replace(destination)
+    _validate_downloaded_audio(destination)
+    _touch_and_trim_downloads(destination)
+    _emit_status(status_callback, 1.0, f"B站音频已就绪：{destination.name}")
+    return destination
+
+
+def _resolve_audio_source(
+    source: str,
+    status_callback: Callable[[float, str], None] | None = None,
+) -> Path:
+    if is_bilibili_source(source):
+        return _resolve_bilibili_audio(source, status_callback)
+    return _resolve_target_audio(source, status_callback)
+
+
+def _resolve_input_audio(
+    source: str | None,
+    upload: str | None,
+    role: str,
+    status_callback: Callable[[float, str], None] | None = None,
+) -> Path:
+    if upload:
+        return _validate_target_file(Path(upload))
+    if str(source or "").strip():
+        return _resolve_audio_source(str(source), status_callback)
+    raise ValueError(f"请提供{role}来源或上传{role}文件")
+
+
 def _validate_parameters(
     pitch_shift: int,
     n_step: int,
@@ -751,12 +797,12 @@ def _soulx_asset_fingerprint(force_refresh: bool = False) -> dict[str, Any]:
         return dict(value)
 
 
-def _cache_key(target_path: Path, profile: dict[str, Any], parameters: dict[str, Any]) -> str:
+def _cache_key(target_path: Path, prompt: dict[str, Any], parameters: dict[str, Any]) -> str:
     payload = {
         "pipeline_version": PIPELINE_VERSION,
         "soulx_assets": _soulx_asset_fingerprint(),
         "target_sha256": _sha256_file(target_path),
-        "prompt_sha256": profile["audio_sha256"],
+        "prompt_sha256": prompt["audio_sha256"],
         **parameters,
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1008,6 +1054,9 @@ def convert(
     cfg: float = 1.0,
     seed: int = 42,
     random_seed: bool = False,
+    target_upload: str | None = None,
+    reference_source: str = "",
+    reference_upload: str | None = None,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str, str]:
     """将目标歌曲交给 SoulX-Singer-SVC 转换，返回 (输出 MP3, 是否命中缓存)。"""
@@ -1017,14 +1066,27 @@ def convert(
         pitch_shift, n_step, cfg, seed = _validate_parameters(pitch_shift, n_step, cfg, seed)
         requested_random = bool(random_seed) or seed == -1
         actual_seed = random.SystemRandom().randint(0, 10000) if seed == -1 else seed
-        profile = _find_profile(str(model_dropdown).strip())
         def source_progress(value: float, description: str) -> None:
             progress(0.02 + 0.06 * value, desc=description)
 
-        target_path = _resolve_target_audio(song_name_src, source_progress)
-        prompt_path = Path(profile["audio_path"])
+        target_path = _resolve_input_audio(song_name_src, target_upload, "目标歌曲", source_progress)
+        if reference_upload or str(reference_source or "").strip():
+            prompt_path = _resolve_input_audio(
+                reference_source,
+                reference_upload,
+                "参考音色",
+                source_progress,
+            )
+            prompt = {
+                "profile_id": "external-reference",
+                "audio_path": str(prompt_path.resolve()),
+                "audio_sha256": _sha256_file(prompt_path),
+            }
+        else:
+            prompt = _find_profile(str(model_dropdown).strip())
+            prompt_path = Path(prompt["audio_path"])
         parameters = {
-            "profile_id": profile["profile_id"],
+            "profile_id": prompt["profile_id"],
             "prompt_vocal_sep": bool(prompt_vocal_sep),
             "target_vocal_sep": bool(target_vocal_sep),
             "auto_shift": bool(auto_shift),
@@ -1034,14 +1096,14 @@ def convert(
             "cfg": cfg,
             "seed": actual_seed,
         }
-        key = _cache_key(target_path, profile, parameters)
+        key = _cache_key(target_path, prompt, parameters)
         cache_path = CACHE_DIR / f"{key}.mp3"
         persistent_cache = bool(CONFIG["cache"]["enabled"]) and (
             not requested_random or bool(CONFIG["cache"]["random_seed_persistent"])
         )
         print(
             "[SVCVC任务Debug] "
-            f"音色={profile['profile_id']} target={target_path.name} "
+            f"音色={prompt['profile_id']} target={target_path.name} "
             f"prompt_sep={bool(prompt_vocal_sep)} target_sep={bool(target_vocal_sep)} "
             f"auto_shift={bool(auto_shift)} auto_mix={bool(auto_mix_acc)} "
             f"pitch={pitch_shift} steps={n_step} cfg={cfg} "
