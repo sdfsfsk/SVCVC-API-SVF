@@ -8,9 +8,11 @@
 
 1. 准备官方 SoulX-Singer，并应用上述 AMD 补丁；在 `启动SoulX-Singer.bat` 中选择 `1`，等待 7861 就绪。
 2. 双击 `启动SVCVC-API.bat`。首次启动会自动安装独立 CPython 3.12 便携环境和轻量依赖。
-3. 中间层默认地址为 `http://127.0.0.1:6767`；启动脚本会读取 `config.json` 中的实际 `server.host` / `server.port`，并清理同端口的旧实例。
+3. 中间层默认地址为 `http://127.0.0.1:6767`，与 `astrbot_plugin_matsuko_cover` v2.8.1 起的默认 `svcvc_base_url` 一致；启动脚本会读取 `config.json` 中的实际 `server.host` / `server.port`，并清理同端口的旧实例。
 
 启动脚本只会结束命令行明确属于本目录 `app.py` 的旧进程；若配置端口属于其他程序会拒绝操作，并等待旧实例真正释放端口后再启动。
+
+合并旧版本后若便携环境缺少新加入的 `yt-dlp`，启动脚本会自动检测并根据 `requirements.txt` 修复依赖。若手动修改 `config.json` 的端口，也需要在 AstrBot 插件配置中同步修改 `svcvc_base_url`，或使用 `/设置svcvc后端链接 <URL>`。
 
 ## 参考音色
 

@@ -24,7 +24,7 @@ try {
         & $installer
     }
 
-    & $python -c "import gradio, gradio_client, httpx, requests, soundfile" 2>$null
+    & $python -c "import gradio, gradio_client, httpx, requests, soundfile, yt_dlp" 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[INFO] Python dependencies are incomplete; repairing them now..."
         & $installer
