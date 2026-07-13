@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import ipaddress
 import json
 import os
@@ -595,6 +596,132 @@ def _get_public_json(url: str, timeout: float) -> dict[str, Any]:
     raise ValueError("未能取得 JSON 服务响应")
 
 
+def _search_netease_songs(keyword: str) -> list[dict[str, str]]:
+    text = str(keyword or "").strip()
+    if not text:
+        raise ValueError("网易云搜索关键词不能为空")
+    timeout = float(CONFIG["download"]["timeout_seconds"])
+    payload = _get_public_json(
+        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': text})}",
+        timeout=timeout,
+    )
+    raw_results = payload.get("data", [])
+    if isinstance(raw_results, dict):
+        raw_results = [raw_results]
+    if not isinstance(raw_results, list):
+        return []
+
+    songs: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        song_id = str(item.get("id") or "").strip()
+        if not song_id or song_id in seen_ids:
+            continue
+        seen_ids.add(song_id)
+        songs.append(
+            {
+                "title": str(item.get("song") or song_id).strip(),
+                "artist": str(item.get("singer") or "").strip(),
+                "cover": str(item.get("cover") or "").strip(),
+                "url": f"https://music.163.com/#/song?id={song_id}",
+            }
+        )
+        if len(songs) >= 10:
+            break
+    return songs
+
+
+def search_song_catalog(platform: str, keyword: str) -> list[dict[str, str]]:
+    if platform == "B站":
+        return search_bilibili_videos(keyword)
+    if platform == "网易云":
+        return _search_netease_songs(keyword)
+    raise ValueError("请选择 B站 或 网易云")
+
+
+def _catalog_url(value: object) -> str:
+    url = str(value or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return url
+    return ""
+
+
+def _catalog_label(item: dict[str, str]) -> str:
+    title = str(item.get("title") or "未命名结果").strip()
+    artist = str(item.get("artist") or "").strip()
+    return f"{title} — {artist}" if artist else title
+
+
+def _catalog_cover_html(item: dict[str, str]) -> str:
+    title = html.escape(str(item.get("title") or "歌曲"), quote=True)
+    cover = _catalog_url(item.get("cover"))
+    if not cover:
+        return '<div style="padding: 1rem; color: #666;">暂无封面</div>'
+    return (
+        f'<img src="{html.escape(cover, quote=True)}" alt="{title} 封面" '
+        'referrerpolicy="no-referrer" '
+        'style="width: min(100%, 320px); aspect-ratio: 1; object-fit: cover; border-radius: 10px;">'
+    )
+
+
+def _catalog_cards_html(results: list[dict[str, str]]) -> str:
+    cards: list[str] = []
+    for item in results:
+        title = html.escape(str(item.get("title") or "未命名结果"), quote=True)
+        artist = html.escape(str(item.get("artist") or "未知作者"), quote=True)
+        url = _catalog_url(item.get("url"))
+        cover = _catalog_url(item.get("cover"))
+        cover_html = (
+            f'<img src="{html.escape(cover, quote=True)}" alt="" '
+            'referrerpolicy="no-referrer" '
+            'style="width: 72px; height: 72px; object-fit: cover; border-radius: 8px; flex: 0 0 auto;">'
+            if cover
+            else '<div style="width: 72px; height: 72px; border-radius: 8px; background: #eee; flex: 0 0 auto;"></div>'
+        )
+        link_html = (
+            f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">打开链接</a>'
+            if url
+            else "链接不可用"
+        )
+        copy_html = (
+            f'<button type="button" data-copy-url="{html.escape(url, quote=True)}" '
+            'onclick="navigator.clipboard.writeText(this.dataset.copyUrl)" '
+            'style="margin-left: auto; white-space: nowrap;">复制链接</button>'
+            if url
+            else ""
+        )
+        cards.append(
+            '<div style="display: flex; gap: 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee;">'
+            f'{cover_html}<div style="min-width: 0;"><div style="font-weight: 600;">{title}</div>'
+            f'<div style="color: #666; margin: 4px 0 8px;">{artist}</div>{link_html}</div>{copy_html}</div>'
+        )
+    return "".join(cards) or '<div style="padding: 1rem; color: #666;">没有结果</div>'
+
+
+def _selected_catalog_result(selected_url: str, results: list[dict[str, str]]) -> tuple[str, str]:
+    for item in results or []:
+        if isinstance(item, dict) and item.get("url") == selected_url:
+            return _catalog_cover_html(item), selected_url
+    return '<div style="padding: 1rem; color: #666;">请选择结果</div>', ""
+
+
+def search_song_catalog_ui(
+    platform: str,
+    keyword: str,
+) -> tuple[list[dict[str, str]], str, dict[str, Any], str, str]:
+    results = search_song_catalog(platform, keyword)
+    if not results:
+        raise ValueError(f"{platform} 没有找到与“{str(keyword).strip()}”匹配的结果")
+    first = results[0]
+    selected_url = str(first["url"])
+    choices = [(_catalog_label(item), str(item["url"])) for item in results]
+    cover_html, link = _selected_catalog_result(selected_url, results)
+    return results, _catalog_cards_html(results), gr.update(choices=choices, value=selected_url), cover_html, link
+
+
 def _download_netease(
     song_id: str,
     status_callback: Callable[[float, str], None] | None = None,
@@ -1177,65 +1304,86 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="SVCVC-API · SoulX-Singer Gateway") as app:
         gr.Markdown(
             "# SVCVC-API\n"
-            "SoulX-Singer-SVC 轻量中间层。参考音色位于 `voice_profiles/`，GPU 推理由 `127.0.0.1:7861` 完成。"
+            "SoulX-Singer-SVC 轻量中间层。GPU 推理由 127.0.0.1:7861 完成。"
         )
-        with gr.Row():
-            song_name_src = gr.Textbox(label="目标音频路径 / HTTP URL / 网易云歌曲 ID")
-            model_dropdown = gr.Dropdown(
-                choices=choices,
-                value=default_profile,
-                label="参考音色",
-                allow_custom_value=True,
-            )
-            refresh_profiles = gr.Button("刷新参考音色", size="sm")
-        with gr.Row():
-            prompt_vocal_sep = gr.Checkbox(False, label="Prompt 人声分离")
-            target_vocal_sep = gr.Checkbox(True, label="Target 人声分离")
-            auto_shift = gr.Checkbox(True, label="自动变调")
-            auto_mix_acc = gr.Checkbox(True, label="自动混合伴奏")
-        with gr.Row():
-            pitch_shift = gr.Slider(-36, 36, value=0, step=1, label="指定变调（半音）")
-            n_step = gr.Slider(1, 200, value=32, step=1, label="采样步数")
-            cfg = gr.Slider(0, 10, value=1.0, step=0.1, label="CFG 系数")
-            seed = gr.Slider(-1, 10000, value=42, step=1, label="种子（-1 为随机）")
-        random_seed = gr.Checkbox(False, label="随机任务（不读取/写入持久缓存）")
-        run_button = gr.Button("开始 SVC Voice Conversion", variant="primary")
-        output_audio = gr.Audio(label="转换结果", type="filepath")
-        cache_hit = gr.Textbox(label="Cache Hit", interactive=False)
+        with gr.Tabs():
+            with gr.Tab("音色转换"):
+                with gr.Row():
+                    target_source = gr.Textbox(label="目标歌曲来源（B站 BV/链接、网易云、HTTP 或本地路径）")
+                    target_upload = gr.Audio(label="目标歌曲本地上传（优先）", type="filepath")
+                with gr.Row():
+                    reference_source = gr.Textbox(label="参考音色来源（B站 BV/链接、网易云、HTTP 或本地路径）")
+                    reference_upload = gr.Audio(label="参考音色本地上传（优先）", type="filepath")
+                    model_dropdown = gr.Dropdown(
+                        choices=choices,
+                        value=default_profile,
+                        label="已保存参考音色（未填写参考来源时使用）",
+                        allow_custom_value=True,
+                    )
+                    refresh_profiles = gr.Button("刷新参考音色", size="sm")
+                with gr.Row():
+                    prompt_vocal_sep = gr.Checkbox(False, label="参考人声分离")
+                    target_vocal_sep = gr.Checkbox(True, label="目标人声分离")
+                    auto_shift = gr.Checkbox(True, label="自动变调")
+                    auto_mix_acc = gr.Checkbox(True, label="自动混合伴奏")
+                with gr.Row():
+                    pitch_shift = gr.Slider(-36, 36, value=0, step=1, label="指定变调（半音）")
+                    n_step = gr.Slider(1, 200, value=32, step=1, label="采样步数")
+                    cfg = gr.Slider(0, 10, value=1.0, step=0.1, label="CFG 系数")
+                    seed = gr.Slider(-1, 10000, value=42, step=1, label="种子（-1 为随机）")
+                random_seed = gr.Checkbox(False, label="随机任务（不读取/写入持久缓存）")
+                run_button = gr.Button("开始 SVC Voice Conversion", variant="primary")
+                output_audio = gr.Audio(label="转换结果", type="filepath")
+                cache_hit = gr.Textbox(label="Cache Hit", interactive=False)
+                run_button.click(
+                    fn=convert,
+                    inputs=[
+                        target_source, model_dropdown, prompt_vocal_sep, target_vocal_sep,
+                        auto_shift, auto_mix_acc, pitch_shift, n_step, cfg, seed, random_seed,
+                        target_upload, reference_source, reference_upload,
+                    ],
+                    outputs=[output_audio, cache_hit],
+                    api_name="convert",
+                    concurrency_limit=1,
+                )
 
-        run_button.click(
-            fn=convert,
-            inputs=[
-                song_name_src,
-                model_dropdown,
-                prompt_vocal_sep,
-                target_vocal_sep,
-                auto_shift,
-                auto_mix_acc,
-                pitch_shift,
-                n_step,
-                cfg,
-                seed,
-                random_seed,
-            ],
-            outputs=[output_audio, cache_hit],
-            api_name="convert",
-            concurrency_limit=1,
-        )
+                def refresh_profile_choices():
+                    refreshed = show_model()
+                    return gr.Dropdown(
+                        choices=refreshed,
+                        value=refreshed[0] if refreshed else None,
+                        allow_custom_value=True,
+                    )
 
-        def refresh_profile_choices():
-            refreshed = show_model()
-            return gr.Dropdown(
-                choices=refreshed,
-                value=refreshed[0] if refreshed else None,
-                allow_custom_value=True,
-            )
+                refresh_profiles.click(
+                    refresh_profile_choices,
+                    outputs=model_dropdown,
+                    api_name="refresh_profiles",
+                )
 
-        refresh_profiles.click(
-            refresh_profile_choices,
-            outputs=model_dropdown,
-            api_name="refresh_profiles",
-        )
+            with gr.Tab("歌曲搜索"):
+                gr.Markdown("搜索 B站音乐区或网易云歌曲；复制链接后可粘贴到目标歌曲或参考音色来源。")
+                with gr.Row():
+                    search_platform = gr.Radio(choices=["B站", "网易云"], value="B站", label="平台")
+                    search_keyword = gr.Textbox(label="关键词", placeholder="例如：七里香 周杰伦", scale=3)
+                    search_button = gr.Button("搜索", variant="primary")
+                search_state = gr.State([])
+                search_cards = gr.HTML('<div style="padding: 1rem; color: #666;">请输入关键词后搜索</div>')
+                with gr.Row():
+                    search_choice = gr.Dropdown(choices=[], label="选择结果", interactive=True, scale=3)
+                    search_link = gr.Textbox(label="歌曲链接", interactive=False, buttons=["copy"], scale=4)
+                search_cover = gr.HTML('<div style="padding: 1rem; color: #666;">选择结果后显示封面</div>')
+                search_button.click(
+                    fn=search_song_catalog_ui,
+                    inputs=[search_platform, search_keyword],
+                    outputs=[search_state, search_cards, search_choice, search_cover, search_link],
+                    api_name="search_song_catalog",
+                )
+                search_choice.change(
+                    fn=_selected_catalog_result,
+                    inputs=[search_choice, search_state],
+                    outputs=[search_cover, search_link],
+                )
 
         api_models = gr.JSON(visible=False)
         api_profiles = gr.JSON(visible=False)
@@ -1254,7 +1402,6 @@ def build_app() -> gr.Blocks:
             concurrency_limit=1,
         )
     return app
-
 
 APP = build_app()
 
