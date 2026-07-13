@@ -598,14 +598,18 @@ def _get_public_json(url: str, timeout: float) -> dict[str, Any]:
     raise ValueError("未能取得 JSON 服务响应")
 
 
+def _netease_provider_page(page: int) -> int:
+    return (max(1, int(page)) - 1) * 10 + 1
+
+
 def _search_netease_songs(keyword: str, page: int = 1) -> list[dict[str, str]]:
     text = str(keyword or "").strip()
     if not text:
         raise ValueError("网易云搜索关键词不能为空")
-    page = max(1, int(page))
+    provider_page = _netease_provider_page(page)
     timeout = float(CONFIG["download"]["timeout_seconds"])
     payload = _get_public_json(
-        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': text, 'page': page})}",
+        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': text, 'page': provider_page})}",
         timeout=timeout,
     )
     raw_results = payload.get("data", [])
