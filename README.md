@@ -18,11 +18,13 @@
 
 ## 来源输入与歌曲搜索
 
-“音色转换”标签页中的目标歌曲和参考音色都支持以下来源：B站 BV 号或视频链接、网易云歌曲 ID 或链接、HTTP(S) 音频链接、本地路径和页面上传文件。
+"音色转换"标签页中的目标歌曲和参考音色都支持以下来源：B站关键词、BV 号、`b23.tv` 短链或视频链接，网易云歌曲 ID 或链接，HTTP(S) 音频链接，本地路径和页面上传文件。
 
 参考音色按以下优先级选择：参考上传文件 > 参考来源文本 > `voice_profiles/` 下拉框。也就是说，旧的已保存音色工作流保持不变；填写或上传临时参考音色后，会优先使用临时参考而不是下拉框选择。
 
-转换输入框不会把普通文字当作 B站关键词搜索。请先到“歌曲搜索”标签页，在 B站音乐分区或网易云搜索歌曲，再复制结果链接到目标歌曲或参考音色来源框。搜索页只用于查找和复制链接，不会自动下载、回填表单或启动转换。
+转换输入框会自动识别 B站关键词，并优先在音乐分区搜索；音乐分区没有结果时会回退全站。也可以先到“歌曲搜索”标签页，在 B站或网易云搜索歌曲，再复制结果链接到目标歌曲或参考音色来源框。搜索页每页显示 10 条，支持上一页/下一页、封面预览和逐条复制链接；它只用于查找和复制链接，不会自动下载、回填表单或启动转换。
+
+网易云搜索优先使用 `api.vkeys.cn`；主接口请求失败、返回异常或没有结果时，会自动改用网易云 Web 搜索接口。备用接口使用标准偏移量分页，并根据返回的 `picId` 生成专辑封面链接。
 
 ## Gradio API
 
@@ -35,7 +37,7 @@
 - `/cache_info`：返回结果、下载和随机输出缓存占用。
 - `/clear_cache`：安全清理 `all`、`results`、`downloads` 或 `outputs`；不会删除 `voice_profiles/` 参考音色。
 - `/convert`：调用 SoulX-SVC，返回 `(output_audio, cache_hit)`。
-- `/search_song_catalog`：搜索 B站音乐分区或网易云，返回搜索页使用的结果、卡片和链接数据。
+- `/search_song_catalog`：搜索 B站或网易云；参数为 `platform`、`keyword` 和可选的 `page=1`，返回搜索页使用的结果、卡片和链接数据。
 
 `/convert` 参数顺序：
 
@@ -48,7 +50,7 @@ target_upload=None, reference_source="", reference_upload=None
 
 原有前 11 个参数的顺序和默认值没有变化；已部署的 AstrBot 插件可继续按旧方式调用 `/convert`。后面的三个参数全部可选，分别对应目标上传文件、临时参考来源和参考上传文件。
 
-`song_name_src` 和 `reference_source` 支持本地绝对路径、HTTP/HTTPS 音频 URL、网易云歌曲 ID 或链接，以及 B站 BV 号、`b23.tv` 短链或 `bilibili.com/video/` 链接。本地文件必须使用支持的音频扩展名且不能超过 `download.max_size_mb`。远程下载会检查每一跳重定向和最终 URL，拒绝本机、私网、链路本地及保留地址，并校验大小、内容类型和音频文件头。QQ 音乐由 AstrBot 插件负责搜索并下载到本地，再把本地文件交给中间层；因此中间层日志会显示为“已收到本地音频（QQ音乐由 AstrBot 插件预下载）”。中间层兼容 SoulX 路径端点 `/soulx_svc_convert_path`、音频端点 `/soulx_svc_convert` 与旧端点 `/_start_svc`，并且只允许一个 GPU 推理任务同时运行。
+`song_name_src` 和 `reference_source` 支持本地绝对路径、HTTP/HTTPS 音频 URL、网易云歌曲 ID 或链接，以及 B站关键词、BV 号、`b23.tv` 短链或 `bilibili.com/video/` 链接。本地文件必须使用支持的音频扩展名且不能超过 `download.max_size_mb`。远程下载会检查每一跳重定向和最终 URL，拒绝本机、私网、链路本地及保留地址，并校验大小、内容类型和音频文件头。QQ 音乐由 AstrBot 插件负责搜索并下载到本地，再把本地文件交给中间层；因此中间层日志会显示为“已收到本地音频（QQ音乐由 AstrBot 插件预下载）”。中间层兼容 SoulX 路径端点 `/soulx_svc_convert_path`、音频端点 `/soulx_svc_convert` 与旧端点 `/_start_svc`，并且只允许一个 GPU 推理任务同时运行。
 
 SoulX 的 Prompt/Target 预处理、F0 提取、逐段推理（如 `9/14`）、伴奏混合和 MP3 导出进度会通过 Gradio 进度事件传给中间层，再由插件按 `progress_update_interval` 输出到 QQ。最终结果统一转为 320 kbps MP3，降低 QQ 语音上传和大 WAV 下载失败的概率；语音发送失败时插件仍会继续尝试发送音频文件。
 
