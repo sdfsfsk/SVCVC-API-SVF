@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import ipaddress
@@ -598,18 +599,31 @@ def _get_public_json(url: str, timeout: float) -> dict[str, Any]:
     raise ValueError("未能取得 JSON 服务响应")
 
 
+_NETEASE_IMAGE_KEY = b"3go8&$8*3*3h0k(2)2"
+_NETEASE_WEB_SEARCH_URL = "https://music.163.com/api/search/get/web"
+
+
 def _netease_provider_page(page: int) -> int:
     return (max(1, int(page)) - 1) * 10 + 1
 
 
-def _search_netease_songs(keyword: str, page: int = 1) -> list[dict[str, str]]:
-    text = str(keyword or "").strip()
+def _netease_cover_url(pic_id: object) -> str:
+    text = str(pic_id or "").strip()
     if not text:
-        raise ValueError("网易云搜索关键词不能为空")
+        return ""
+    encrypted = bytearray(text.encode("utf-8"))
+    for index in range(len(encrypted)):
+        encrypted[index] ^= _NETEASE_IMAGE_KEY[index % len(_NETEASE_IMAGE_KEY)]
+    hash_part = base64.b64encode(hashlib.md5(encrypted).digest()).decode("ascii")
+    hash_part = hash_part.replace("/", "_").replace("+", "-")
+    return f"https://p1.music.126.net/{hash_part}/{text}.jpg"
+
+
+def _search_netease_songs_vkeys(keyword: str, page: int) -> list[dict[str, str]]:
     provider_page = _netease_provider_page(page)
     timeout = float(CONFIG["download"]["timeout_seconds"])
     payload = _get_public_json(
-        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': text, 'page': provider_page})}",
+        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': keyword, 'page': provider_page})}",
         timeout=timeout,
     )
     raw_results = payload.get("data", [])
@@ -638,6 +652,78 @@ def _search_netease_songs(keyword: str, page: int = 1) -> list[dict[str, str]]:
         if len(songs) >= 10:
             break
     return songs
+
+
+def _search_netease_songs_official(keyword: str, page: int) -> list[dict[str, str]]:
+    timeout = float(CONFIG["download"]["timeout_seconds"])
+    response = requests.post(
+        _NETEASE_WEB_SEARCH_URL,
+        data={
+            "s": keyword,
+            "limit": 10,
+            "type": 1,
+            "offset": (max(1, int(page)) - 1) * 10,
+        },
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.163.com/",
+        },
+        cookies={"appver": "2.0.2"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("code") != 200:
+        raise ValueError("网易云备用搜索接口返回异常")
+    result = payload.get("result", {})
+    raw_results = result.get("songs", []) if isinstance(result, dict) else []
+    if not isinstance(raw_results, list):
+        return []
+
+    songs: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        song_id = str(item.get("id") or "").strip()
+        if not song_id:
+            continue
+        artists = item.get("artists", [])
+        artist = " / ".join(
+            str(entry.get("name") or "").strip()
+            for entry in artists
+            if isinstance(entry, dict) and str(entry.get("name") or "").strip()
+        )
+        album = item.get("album", {})
+        cover = _netease_cover_url(album.get("picId")) if isinstance(album, dict) else ""
+        songs.append(
+            {
+                "title": str(item.get("name") or song_id).strip(),
+                "artist": artist,
+                "cover": cover,
+                "url": f"https://music.163.com/#/song?id={song_id}",
+            }
+        )
+    return songs
+
+
+def _search_netease_songs(keyword: str, page: int = 1) -> list[dict[str, str]]:
+    text = str(keyword or "").strip()
+    if not text:
+        raise ValueError("网易云搜索关键词不能为空")
+    try:
+        primary_results = _search_netease_songs_vkeys(text, page)
+    except (requests.RequestException, ValueError) as primary_error:
+        primary_results = []
+    else:
+        primary_error = None
+    if primary_results:
+        return primary_results
+    try:
+        return _search_netease_songs_official(text, page)
+    except (requests.RequestException, ValueError) as backup_error:
+        if primary_error is not None:
+            raise RuntimeError(f"网易云搜索失败：主接口和备用接口均不可用（{backup_error}）") from backup_error
+        raise RuntimeError(f"网易云搜索失败：备用接口不可用（{backup_error}）") from backup_error
 
 
 def search_song_catalog(platform: str, keyword: str, page: int = 1) -> list[dict[str, str]]:
