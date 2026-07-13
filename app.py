@@ -1312,7 +1312,10 @@ def build_app() -> gr.Blocks:
                     target_source = gr.Textbox(label="目标歌曲来源（B站 BV/链接、网易云、HTTP 或本地路径）")
                     target_upload = gr.Audio(label="目标歌曲本地上传（优先）", type="filepath")
                 with gr.Row():
-                    reference_source = gr.Textbox(label="参考音色来源（B站 BV/链接、网易云、HTTP 或本地路径）")
+                    reference_source = gr.Textbox(
+                        value="",
+                        label="参考音色来源（B站 BV/链接、网易云、HTTP 或本地路径）",
+                    )
                     reference_upload = gr.Audio(label="参考音色本地上传（优先）", type="filepath")
                     model_dropdown = gr.Dropdown(
                         choices=choices,
