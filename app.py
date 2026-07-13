@@ -16,7 +16,7 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import gradio as gr
 import requests
