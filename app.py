@@ -22,8 +22,10 @@ import gradio as gr
 import requests
 from bilibili_source import (
     download_bilibili_audio,
+    is_bilibili_search_keyword,
     is_bilibili_source,
     resolve_bilibili_video_url,
+    search_bilibili_first_video,
     search_bilibili_videos,
 )
 from gradio_client import Client, handle_file
@@ -804,7 +806,7 @@ def _resolve_bilibili_audio(
     source: str,
     status_callback: Callable[[float, str], None] | None = None,
 ) -> Path:
-    video_url = resolve_bilibili_video_url(source)
+    video_url = resolve_bilibili_video_url(source, search=search_bilibili_first_video)
     key = hashlib.sha256(video_url.encode("utf-8")).hexdigest()[:24]
     destination = DOWNLOAD_DIR / f"bilibili_{key}.wav"
     if not destination.is_file() or destination.stat().st_size <= 0:
@@ -827,7 +829,7 @@ def _resolve_audio_source(
     source: str,
     status_callback: Callable[[float, str], None] | None = None,
 ) -> Path:
-    if is_bilibili_source(source):
+    if is_bilibili_source(source) or is_bilibili_search_keyword(source):
         return _resolve_bilibili_audio(source, status_callback)
     return _resolve_target_audio(source, status_callback)
 
@@ -1314,12 +1316,12 @@ def build_app() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab("音色转换"):
                 with gr.Row():
-                    target_source = gr.Textbox(label="目标歌曲来源（B站 BV/链接、网易云、HTTP 或本地路径）")
+                    target_source = gr.Textbox(label="目标歌曲来源（B站关键词/BV/链接、网易云、HTTP 或本地路径）")
                     target_upload = gr.Audio(label="目标歌曲本地上传（优先）", type="filepath")
                 with gr.Row():
                     reference_source = gr.Textbox(
                         value="",
-                        label="参考音色来源（B站 BV/链接、网易云、HTTP 或本地路径）",
+                        label="参考音色来源（B站关键词/BV/链接、网易云、HTTP 或本地路径）",
                     )
                     reference_upload = gr.Audio(label="参考音色本地上传（优先）", type="filepath")
                     model_dropdown = gr.Dropdown(

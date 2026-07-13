@@ -4,6 +4,7 @@ import hashlib
 import html
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 
@@ -37,7 +38,21 @@ def is_bilibili_source(value: str) -> bool:
     )
 
 
-def resolve_bilibili_video_url(value: str) -> str:
+def is_bilibili_search_keyword(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or is_bilibili_source(text) or re.fullmatch(r"\d{1,20}", text):
+        return False
+    parsed = urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return False
+    local = Path(text).expanduser()
+    return not local.drive and not text.startswith((".", "~", "\\", "/"))
+
+
+def resolve_bilibili_video_url(
+    value: str,
+    search: Callable[[str], str] | None = None,
+) -> str:
     text = str(value or "").strip()
     match = _BV_RE.search(text)
     if match:
@@ -49,6 +64,8 @@ def resolve_bilibili_video_url(value: str) -> str:
         return text
     if "bilibili.com" in host and "/video/" in parsed.path:
         return text
+    if search is not None and is_bilibili_search_keyword(text):
+        return search(text)
     raise ValueError("B站来源必须是 BV 号、b23.tv 短链或 bilibili.com/video 链接")
 
 
@@ -164,6 +181,16 @@ def search_bilibili_videos(
     finally:
         if close_client:
             client.close()
+
+
+def search_bilibili_first_video(
+    keyword: str,
+    session: requests.Session | None = None,
+) -> str:
+    videos = search_bilibili_videos(keyword, session=session, limit=1)
+    if videos:
+        return videos[0]["url"]
+    raise ValueError("B站搜索没有找到视频")
 
 
 def download_bilibili_audio(
