@@ -802,6 +802,33 @@ def _resolve_target_audio(
     raise FileNotFoundError(f"找不到目标音频，也无法识别为 HTTP/网易云来源: {source}")
 
 
+def _ffmpeg_paths() -> tuple[Path, Path]:
+    bundled_ffmpeg = FFMPEG_PATH
+    bundled_ffprobe = bundled_ffmpeg.with_name("ffprobe.exe")
+    if bundled_ffmpeg.is_file() and bundled_ffprobe.is_file():
+        return bundled_ffmpeg, bundled_ffprobe
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg and ffprobe:
+        system_ffmpeg = Path(ffmpeg).resolve()
+        system_ffprobe = Path(ffprobe).resolve()
+        if system_ffmpeg.parent == system_ffprobe.parent:
+            return system_ffmpeg, system_ffprobe
+    raise FileNotFoundError(
+        "找不到可用的 FFmpeg 和 FFprobe；请将它们放到 "
+        f"{FFMPEG_PATH.parent}，或加入系统 PATH"
+    )
+
+
+def _ffmpeg_location() -> Path:
+    return _ffmpeg_paths()[0].parent
+
+
+def _ffmpeg_executable() -> Path:
+    return _ffmpeg_paths()[0]
+
+
 def _resolve_bilibili_audio(
     source: str,
     status_callback: Callable[[float, str], None] | None = None,
@@ -814,7 +841,7 @@ def _resolve_bilibili_audio(
         downloaded = download_bilibili_audio(
             video_url,
             destination,
-            FFMPEG_PATH.parent,
+            _ffmpeg_location(),
             _download_max_bytes(),
         )
         if downloaded.resolve() != destination.resolve():
@@ -1100,13 +1127,12 @@ def _call_soulx(
 
 def _export_mp3(source: Path, destination: Path) -> Path:
     """Export a QQ-friendly high-quality MP3 atomically."""
-    if not FFMPEG_PATH.is_file():
-        raise FileNotFoundError(f"找不到 FFmpeg: {FFMPEG_PATH}")
+    ffmpeg = _ffmpeg_executable()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.stem + ".tmp.mp3")
     temporary.unlink(missing_ok=True)
     command = [
-        str(FFMPEG_PATH),
+        str(ffmpeg),
         "-y",
         "-hide_banner",
         "-loglevel",
