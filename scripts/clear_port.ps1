@@ -1,5 +1,5 @@
 param(
-    [int]$Port = 6666,
+    [int]$Port = 6767,
     [Parameter(Mandatory = $true)]
     [string]$ExpectedApp,
     [int]$WaitSeconds = 10

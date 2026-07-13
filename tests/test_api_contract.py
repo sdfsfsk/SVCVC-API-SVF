@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 
 import app
+
+
+def test_default_server_port_is_6767():
+    assert app.DEFAULT_CONFIG["server"]["port"] == 6767
+    config = json.loads((Path(app.BASE_DIR) / "config.json").read_text(encoding="utf-8"))
+    assert config["server"]["port"] == 6767
+    clear_port_script = (Path(app.BASE_DIR) / "scripts" / "clear_port.ps1").read_text(encoding="utf-8")
+    assert "[int]$Port = 6767" in clear_port_script
 
 
 def test_convert_legacy_prefix_and_optional_extensions():
