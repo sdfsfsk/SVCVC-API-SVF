@@ -809,7 +809,12 @@ def _resolve_bilibili_audio(
     destination = DOWNLOAD_DIR / f"bilibili_{key}.wav"
     if not destination.is_file() or destination.stat().st_size <= 0:
         _emit_status(status_callback, 0.0, "正在下载 B 站音频...")
-        downloaded = download_bilibili_audio(video_url, destination, FFMPEG_PATH.parent)
+        downloaded = download_bilibili_audio(
+            video_url,
+            destination,
+            FFMPEG_PATH.parent,
+            _download_max_bytes(),
+        )
         if downloaded.resolve() != destination.resolve():
             downloaded.replace(destination)
     _validate_downloaded_audio(destination)

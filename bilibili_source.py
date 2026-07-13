@@ -166,7 +166,12 @@ def search_bilibili_videos(
             client.close()
 
 
-def download_bilibili_audio(video_url: str, destination: Path, ffmpeg_location: Path) -> Path:
+def download_bilibili_audio(
+    video_url: str,
+    destination: Path,
+    ffmpeg_location: Path,
+    max_bytes: int,
+) -> Path:
     try:
         from yt_dlp import YoutubeDL
     except ImportError as exc:
@@ -177,6 +182,7 @@ def download_bilibili_audio(video_url: str, destination: Path, ffmpeg_location: 
     options = {
         "noplaylist": True,
         "format": "bestaudio/best",
+        "max_filesize": max(1, int(max_bytes)),
         "outtmpl": str(destination.with_suffix(".%(ext)s")),
         "quiet": True,
         "no_warnings": True,

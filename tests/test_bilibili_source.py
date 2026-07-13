@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import sys
+import types
+
 from bilibili_source import (
+    download_bilibili_audio,
     is_bilibili_source,
     resolve_bilibili_video_url,
     search_bilibili_videos,
@@ -82,3 +86,33 @@ def test_search_prefers_music_partition_and_normalizes_cover():
             "url": "https://www.bilibili.com/video/BV1xx411c7mD",
         }
     ]
+
+
+def test_download_passes_max_file_size_to_ytdlp(monkeypatch, tmp_path):
+    destination = tmp_path / "audio.wav"
+    captured: dict[str, object] = {}
+
+    class Downloader:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def download(self, _urls):
+            destination.write_bytes(b"RIFFxxxxWAVE")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=Downloader))
+
+    result = download_bilibili_audio(
+        "https://www.bilibili.com/video/BV1xx411c7mD",
+        destination,
+        tmp_path,
+        max_bytes=12_345,
+    )
+
+    assert result == destination
+    assert captured["max_filesize"] == 12_345
