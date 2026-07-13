@@ -23,7 +23,7 @@ from gradio_client import Client, handle_file
 
 
 APP_NAME = "SVCVC-API"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 PIPELINE_VERSION = "soulx-svcvc-v3"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("SVCVC_CONFIG", BASE_DIR / "config.json"))
@@ -201,6 +201,67 @@ def list_voice_profiles() -> list[dict[str, Any]]:
     profiles = _scan_voice_profiles()
     print(f"[音色详情Debug] 返回 {len(profiles)} 个音色配置", flush=True)
     return profiles
+
+
+def _cache_areas() -> dict[str, Path]:
+    return {"results": CACHE_DIR, "downloads": DOWNLOAD_DIR, "outputs": OUTPUT_DIR}
+
+
+def _managed_cache_files(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root.resolve(strict=True))
+            if path.is_file() and not path.is_symlink():
+                files.append(resolved)
+        except (OSError, ValueError):
+            continue
+    return files
+
+
+def cache_info() -> dict[str, Any]:
+    areas: dict[str, dict[str, int]] = {}
+    for name, root in _cache_areas().items():
+        files = _managed_cache_files(root)
+        areas[name] = {
+            "files": len(files),
+            "bytes": sum(path.stat().st_size for path in files),
+        }
+    return {
+        "service": APP_NAME,
+        "areas": areas,
+        "total_files": sum(item["files"] for item in areas.values()),
+        "total_bytes": sum(item["bytes"] for item in areas.values()),
+    }
+
+
+def clear_cache(scope: str = "all") -> dict[str, Any]:
+    requested = str(scope or "all").strip().lower()
+    all_areas = _cache_areas()
+    selected = all_areas if requested == "all" else {key: value for key, value in all_areas.items() if key == requested}
+    if not selected:
+        raise gr.Error(f"未知缓存区域: {scope}；可用值: all, {', '.join(all_areas)}")
+    deleted = freed = 0
+    with GPU_JOB_LOCK:
+        for root in selected.values():
+            for path in _managed_cache_files(root):
+                try:
+                    size = path.stat().st_size
+                    path.unlink(missing_ok=True)
+                    deleted += 1
+                    freed += size
+                except OSError as exc:
+                    print(f"[WARN] 无法清理缓存 {path}: {exc}", flush=True)
+            for directory in sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda p: len(p.parts), reverse=True):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+    print(f"[缓存清理Debug] scope={requested} files={deleted} bytes={freed}", flush=True)
+    return {"scope": requested, "deleted_files": deleted, "freed_bytes": freed}
 
 
 def _normalize_endpoint_name(name: Any) -> str | None:
@@ -988,6 +1049,7 @@ def convert(
             flush=True,
         )
         if persistent_cache and cache_path.is_file() and cache_path.stat().st_size > 0:
+            os.utime(cache_path, None)
             print(f"[缓存命中] {cache_path.name} | 实际种子={actual_seed}", flush=True)
             progress(1.0, desc=f"缓存命中 / Cache hit，实际种子 {actual_seed}")
             return str(cache_path.resolve()), "true"
@@ -995,6 +1057,7 @@ def convert(
         progress(0.08, desc=f"等待 SoulX GPU 队列，实际种子 {actual_seed}...")
         with GPU_JOB_LOCK:
             if persistent_cache and cache_path.is_file() and cache_path.stat().st_size > 0:
+                os.utime(cache_path, None)
                 print(f"[缓存命中] GPU 队列复查命中 {cache_path.name}", flush=True)
                 progress(1.0, desc=f"缓存命中 / Cache hit，实际种子 {actual_seed}")
                 return str(cache_path.resolve()), "true"
@@ -1056,7 +1119,13 @@ def build_app() -> gr.Blocks:
         )
         with gr.Row():
             song_name_src = gr.Textbox(label="目标音频路径 / HTTP URL / 网易云歌曲 ID")
-            model_dropdown = gr.Dropdown(choices=choices, value=default_profile, label="参考音色")
+            model_dropdown = gr.Dropdown(
+                choices=choices,
+                value=default_profile,
+                label="参考音色",
+                allow_custom_value=True,
+            )
+            refresh_profiles = gr.Button("刷新参考音色", size="sm")
         with gr.Row():
             prompt_vocal_sep = gr.Checkbox(False, label="Prompt 人声分离")
             target_vocal_sep = gr.Checkbox(True, label="Target 人声分离")
@@ -1092,12 +1161,36 @@ def build_app() -> gr.Blocks:
             concurrency_limit=1,
         )
 
+        def refresh_profile_choices():
+            refreshed = show_model()
+            return gr.Dropdown(
+                choices=refreshed,
+                value=refreshed[0] if refreshed else None,
+                allow_custom_value=True,
+            )
+
+        refresh_profiles.click(
+            refresh_profile_choices,
+            outputs=model_dropdown,
+            api_name="refresh_profiles",
+        )
+
         api_models = gr.JSON(visible=False)
         api_profiles = gr.JSON(visible=False)
         api_health = gr.JSON(visible=False)
+        api_cache = gr.JSON(visible=False)
+        api_cache_scope = gr.Textbox(value="all", visible=False)
         app.load(fn=show_model, inputs=[], outputs=api_models, api_name="show_model")
         app.load(fn=list_voice_profiles, inputs=[], outputs=api_profiles, api_name="list_voice_profiles")
         app.load(fn=health, inputs=[], outputs=api_health, api_name="health")
+        app.load(fn=cache_info, inputs=[], outputs=api_cache, api_name="cache_info")
+        gr.Button("API Clear Cache", visible=False).click(
+            fn=clear_cache,
+            inputs=[api_cache_scope],
+            outputs=[api_cache],
+            api_name="clear_cache",
+            concurrency_limit=1,
+        )
     return app
 
 
