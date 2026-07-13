@@ -111,11 +111,13 @@ def search_bilibili_videos(
     keyword: str,
     session: requests.Session | None = None,
     limit: int = 10,
+    page: int = 1,
 ) -> list[dict[str, str]]:
     text = str(keyword or "").strip()
     if not text:
         raise ValueError("B站搜索关键词不能为空")
     limit = max(1, int(limit))
+    page = max(1, int(page))
     client = session or requests.Session()
     close_client = session is None
     headers = {
@@ -137,8 +139,8 @@ def search_bilibili_videos(
         sub_key = _wbi_key_from_url(wbi_img.get("sub_url"))
 
         for parameters in (
-            {"search_type": "video", "keyword": text, "page": 1, "tids": 3},
-            {"search_type": "video", "keyword": text, "page": 1},
+            {"search_type": "video", "keyword": text, "page": page, "tids": 3},
+            {"search_type": "video", "keyword": text, "page": page},
         ):
             response = client.get(
                 _BILIBILI_SEARCH_URL,

@@ -598,13 +598,14 @@ def _get_public_json(url: str, timeout: float) -> dict[str, Any]:
     raise ValueError("未能取得 JSON 服务响应")
 
 
-def _search_netease_songs(keyword: str) -> list[dict[str, str]]:
+def _search_netease_songs(keyword: str, page: int = 1) -> list[dict[str, str]]:
     text = str(keyword or "").strip()
     if not text:
         raise ValueError("网易云搜索关键词不能为空")
+    page = max(1, int(page))
     timeout = float(CONFIG["download"]["timeout_seconds"])
     payload = _get_public_json(
-        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': text})}",
+        f"https://api.vkeys.cn/v2/music/netease?{urlencode({'word': text, 'page': page})}",
         timeout=timeout,
     )
     raw_results = payload.get("data", [])
@@ -635,11 +636,11 @@ def _search_netease_songs(keyword: str) -> list[dict[str, str]]:
     return songs
 
 
-def search_song_catalog(platform: str, keyword: str) -> list[dict[str, str]]:
+def search_song_catalog(platform: str, keyword: str, page: int = 1) -> list[dict[str, str]]:
     if platform == "B站":
-        return search_bilibili_videos(keyword)
+        return search_bilibili_videos(keyword, page=page)
     if platform == "网易云":
-        return _search_netease_songs(keyword)
+        return _search_netease_songs(keyword, page=page)
     raise ValueError("请选择 B站 或 网易云")
 
 
@@ -713,15 +714,33 @@ def _selected_catalog_result(selected_url: str, results: list[dict[str, str]]) -
 def search_song_catalog_ui(
     platform: str,
     keyword: str,
-) -> tuple[list[dict[str, str]], str, dict[str, Any], str, str]:
-    results = search_song_catalog(platform, keyword)
+    page: int = 1,
+) -> tuple[list[dict[str, str]], str, dict[str, Any], str, str, dict[str, Any], dict[str, Any]]:
+    current_page = max(1, int(page))
+    results = search_song_catalog(platform, keyword, page=current_page)
     if not results:
         raise ValueError(f"{platform} 没有找到与“{str(keyword).strip()}”匹配的结果")
     first = results[0]
     selected_url = str(first["url"])
     choices = [(_catalog_label(item), str(item["url"])) for item in results]
     cover_html, link = _selected_catalog_result(selected_url, results)
-    return results, _catalog_cards_html(results), gr.update(choices=choices, value=selected_url), cover_html, link
+    return (
+        results,
+        _catalog_cards_html(results),
+        gr.update(choices=choices, value=selected_url),
+        cover_html,
+        link,
+        gr.update(value=current_page),
+        gr.update(interactive=current_page > 1),
+    )
+
+
+def _change_catalog_page(page: int, delta: int) -> int:
+    return max(1, int(page) + delta)
+
+
+def _reset_catalog_page() -> tuple[int, dict[str, Any]]:
+    return 1, gr.update(interactive=False)
 
 
 def _download_netease(
@@ -1406,14 +1425,40 @@ def build_app() -> gr.Blocks:
                 search_state = gr.State([])
                 search_cards = gr.HTML('<div style="padding: 1rem; color: #666;">请输入关键词后搜索</div>')
                 with gr.Row():
+                    previous_page = gr.Button("上一页", interactive=False, scale=1)
+                    search_page = gr.Number(value=1, minimum=1, precision=0, label="页码", interactive=False, scale=1)
+                    next_page = gr.Button("下一页", scale=1)
+                with gr.Row():
                     search_choice = gr.Dropdown(choices=[], label="选择结果", interactive=True, scale=3)
                     search_link = gr.Textbox(label="歌曲链接", interactive=False, buttons=["copy"], scale=4)
                 search_cover = gr.HTML('<div style="padding: 1rem; color: #666;">选择结果后显示封面</div>')
                 search_button.click(
+                    fn=_reset_catalog_page,
+                    outputs=[search_page, previous_page],
+                    api_name=False,
+                ).then(
                     fn=search_song_catalog_ui,
-                    inputs=[search_platform, search_keyword],
-                    outputs=[search_state, search_cards, search_choice, search_cover, search_link],
+                    inputs=[search_platform, search_keyword, search_page],
+                    outputs=[search_state, search_cards, search_choice, search_cover, search_link, search_page, previous_page],
                     api_name="search_song_catalog",
+                )
+                previous_page.click(
+                    fn=lambda page: _change_catalog_page(page, -1),
+                    inputs=search_page,
+                    outputs=search_page,
+                ).then(
+                    fn=search_song_catalog_ui,
+                    inputs=[search_platform, search_keyword, search_page],
+                    outputs=[search_state, search_cards, search_choice, search_cover, search_link, search_page, previous_page],
+                )
+                next_page.click(
+                    fn=lambda page: _change_catalog_page(page, 1),
+                    inputs=search_page,
+                    outputs=search_page,
+                ).then(
+                    fn=search_song_catalog_ui,
+                    inputs=[search_platform, search_keyword, search_page],
+                    outputs=[search_state, search_cards, search_choice, search_cover, search_link, search_page, previous_page],
                 )
                 search_choice.change(
                     fn=_selected_catalog_result,
