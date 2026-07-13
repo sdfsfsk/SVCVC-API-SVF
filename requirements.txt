@@ -3,3 +3,4 @@ gradio-client==2.0.3
 httpx==0.28.1
 requests==2.32.5
 soundfile==0.13.1
+yt-dlp>=2025.1.15
