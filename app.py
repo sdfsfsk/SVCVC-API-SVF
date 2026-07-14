@@ -30,11 +30,12 @@ from bilibili_source import (
     search_bilibili_videos,
 )
 from gradio_client import Client, handle_file
+from msst_bridge import MSSTBridgeError, describe_msst, list_msst_models, separate_target
 
 
 APP_NAME = "SVCVC-API"
-APP_VERSION = "1.2.1"
-PIPELINE_VERSION = "soulx-svcvc-v3"
+APP_VERSION = "1.4.2"
+PIPELINE_VERSION = "soulx-svcvc-v5-msst-model-api"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("SVCVC_CONFIG", BASE_DIR / "config.json"))
 VOICE_DIR = BASE_DIR / "voice_profiles"
@@ -42,6 +43,7 @@ CACHE_DIR = BASE_DIR / "cache"
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 SOULX_DOWNLOAD_DIR = OUTPUT_DIR / "_soulx_downloads"
+MSST_STEM_DIR = CACHE_DIR / "_msst_stems"
 SOULX_ROOT = BASE_DIR.parent / "SoulX-Singer"
 SOULX_MODEL_PATH = SOULX_ROOT / "pretrained_models" / "SoulX-Singer" / "model-svc.pt"
 FFMPEG_PATH = SOULX_ROOT / "ffmpeg" / "bin" / "ffmpeg.exe"
@@ -58,9 +60,11 @@ SOULX_ENDPOINT_CANDIDATES = (
     "/soulx_svc_convert",
     "/_start_svc",
 )
+SOULX_EXTERNAL_ACC_ENDPOINT = "/soulx_svc_convert_external_acc_path"
 GPU_JOB_LOCK = threading.Lock()
 DOWNLOAD_CACHE_LOCK = threading.Lock()
 SOULX_FINGERPRINT_LOCK = threading.Lock()
+CONFIG_WRITE_LOCK = threading.Lock()
 _SOULX_FINGERPRINT_CACHE: dict[str, Any] = {"checked_at": 0.0, "value": None}
 MAX_PROFILE_ID_LENGTH = 80
 WINDOWS_DANGEROUS_CHARS = set('<>:"/\\|?*')
@@ -77,6 +81,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "http://127.0.0.1:7861",
         "request_timeout_seconds": 9000,
         "asset_fingerprint_refresh_seconds": 5,
+    },
+    "msst": {
+        "root": ".",
+        "model": "bs_roformer_ep_317_sdr_12.9755",
+        "batch_size": 1,
+        "num_overlap": 4,
+        "normalize": False,
+        "use_tta": False,
+        "stem_cache_max_files": 20,
     },
     "download": {
         "timeout_seconds": 60,
@@ -114,8 +127,25 @@ def _load_config() -> dict[str, Any]:
 
 
 CONFIG = _load_config()
-for directory in (VOICE_DIR, CACHE_DIR, DOWNLOAD_DIR, OUTPUT_DIR, SOULX_DOWNLOAD_DIR):
+for directory in (
+    VOICE_DIR,
+    CACHE_DIR,
+    DOWNLOAD_DIR,
+    OUTPUT_DIR,
+    SOULX_DOWNLOAD_DIR,
+    MSST_STEM_DIR,
+):
     directory.mkdir(parents=True, exist_ok=True)
+
+
+def _save_config() -> None:
+    """Persist the merged configuration atomically."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    serialized = json.dumps(CONFIG, ensure_ascii=False, indent=2) + "\n"
+    with CONFIG_WRITE_LOCK:
+        temporary.write_text(serialized, encoding="utf-8")
+        os.replace(temporary, CONFIG_PATH)
 
 
 def _sha256_file(path: Path) -> str:
@@ -270,6 +300,17 @@ def clear_cache(scope: str = "all") -> dict[str, Any]:
                     directory.rmdir()
                 except OSError:
                     pass
+        # results/all 会移除 CACHE_DIR 下的 _msst_stems，outputs/all 会移除
+        # _soulx_downloads。缓存清理完成后必须恢复运行期目录，否则下一次
+        # tempfile.mkdtemp(dir=...) 会直接触发 WinError 3。
+        for directory in (
+            CACHE_DIR,
+            DOWNLOAD_DIR,
+            OUTPUT_DIR,
+            SOULX_DOWNLOAD_DIR,
+            MSST_STEM_DIR,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
     print(f"[缓存清理Debug] scope={requested} files={deleted} bytes={freed}", flush=True)
     return {"scope": requested, "deleted_files": deleted, "freed_bytes": freed}
 
@@ -280,19 +321,39 @@ def _normalize_endpoint_name(name: Any) -> str | None:
     return "/" + name.strip().lstrip("/")
 
 
-def _discover_soulx_endpoints(base_url: str, timeout: float = 3.0) -> list[str]:
+def _discover_soulx_api_names(base_url: str, timeout: float = 3.0) -> set[str]:
     response = requests.get(f"{base_url.rstrip('/')}/config", timeout=timeout)
     response.raise_for_status()
     config = response.json()
     found: set[str] = set()
     for dependency in config.get("dependencies", []):
         endpoint = _normalize_endpoint_name(dependency.get("api_name"))
-        if endpoint in SOULX_ENDPOINT_CANDIDATES:
+        if endpoint:
             found.add(endpoint)
+    return found
+
+
+def _discover_soulx_endpoints(base_url: str, timeout: float = 3.0) -> list[str]:
+    found = _discover_soulx_api_names(base_url, timeout)
     # Prefer the local-path endpoint even if Gradio lists the visible Audio
     # endpoint first.  Both services run on this machine, so transferring a
     # large WAV through HTTP is unnecessary and less reliable.
     return [endpoint for endpoint in SOULX_ENDPOINT_CANDIDATES if endpoint in found]
+
+
+def _require_soulx_external_acc_endpoint() -> None:
+    """Fail before MSST work when the running SoulX process is still unpatched."""
+    base_url = str(CONFIG["soulx"]["base_url"]).rstrip("/")
+    try:
+        endpoints = _discover_soulx_api_names(base_url, timeout=5.0)
+    except Exception as exc:
+        raise RuntimeError(f"无法检查 SoulX-Singer 7861 接口: {exc}") from exc
+    if SOULX_EXTERNAL_ACC_ENDPOINT not in endpoints:
+        raise RuntimeError(
+            "当前运行中的 SoulX-Singer 7861 未加载 MSST 外部伴奏接口 "
+            f"{SOULX_EXTERNAL_ACC_ENDPOINT}；请关闭旧 7861，并用当前目录的"
+            "《启动SoulX-Singer.bat》重新选择 1 启动"
+        )
 
 
 def health() -> dict[str, Any]:
@@ -301,12 +362,28 @@ def health() -> dict[str, Any]:
     online = False
     endpoints: list[str] = []
     error = ""
+    external_acc_api = False
     try:
-        endpoints = _discover_soulx_endpoints(base_url)
+        all_endpoints = _discover_soulx_api_names(base_url)
+        endpoints = [endpoint for endpoint in SOULX_ENDPOINT_CANDIDATES if endpoint in all_endpoints]
+        external_acc_api = SOULX_EXTERNAL_ACC_ENDPOINT in all_endpoints
         online = True
     except Exception as exc:  # health 必须返回结构化结果，不能让检查接口本身失败
         error = str(exc)
     compatible = online and bool(endpoints)
+    msst_info: dict[str, Any] = {}
+    msst_error = ""
+    try:
+        resolved_msst = _msst_description()
+        msst_info = {
+            "ready": True,
+            "model": resolved_msst["model_id"],
+            "runtime": resolved_msst["runtime_path"],
+            "settings": resolved_msst["settings"],
+        }
+    except Exception as exc:
+        msst_error = str(exc)
+        msst_info = {"ready": False, "error": msst_error}
     return {
         "status": "ok" if compatible else "degraded",
         "service": APP_NAME,
@@ -319,8 +396,10 @@ def health() -> dict[str, Any]:
             "compatible_api": compatible,
             "available_endpoints": endpoints,
             "preferred_endpoint": endpoints[0] if endpoints else None,
+            "external_accompaniment_api": external_acc_api,
             "error": error,
         },
+        "msst": msst_info,
     }
 
 
@@ -1067,6 +1146,188 @@ def _soulx_asset_fingerprint(force_refresh: bool = False) -> dict[str, Any]:
         return dict(value)
 
 
+def _normalize_target_separation(value: Any, legacy_target_vocal_sep: bool = True) -> str:
+    aliases = {
+        "soulx": "soulx",
+        "soulx目标歌曲人声分离": "soulx",
+        "soulx 目标歌曲人声分离": "soulx",
+        "msst": "msst",
+        "msst人声分离": "msst",
+        "msst 人声分离": "msst",
+        "none": "none",
+        "off": "none",
+        "关闭": "none",
+        "不分离": "none",
+    }
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return "soulx" if bool(legacy_target_vocal_sep) else "none"
+    normalized = aliases.get(raw)
+    if normalized is None:
+        raise ValueError("目标歌曲人声分离方式只能是 soulx、msst 或 none")
+    return normalized
+
+
+def _msst_description() -> dict[str, Any]:
+    return describe_msst(BASE_DIR, dict(CONFIG.get("msst") or {}))
+
+
+def show_msst_models() -> list[dict[str, Any]]:
+    """Return installed SVCVC MSST models and mark the persisted default."""
+    models = list_msst_models(BASE_DIR, dict(CONFIG.get("msst") or {}))
+    safe_models = [
+        {
+            "id": item["id"],
+            "name": item["name"],
+            "current": bool(item.get("current")),
+        }
+        for item in models
+    ]
+    print(
+        "[SVCVC MSST模型列表Debug] "
+        + ", ".join(
+            f"{item['id']}{' [current]' if item['current'] else ''}" for item in safe_models
+        ),
+        flush=True,
+    )
+    return safe_models
+
+
+def select_msst_model(model_name: str) -> dict[str, Any]:
+    """Select an installed bundled MSST model and persist it for later tasks."""
+    requested = str(model_name or "").strip()
+    models = show_msst_models()
+    selected: dict[str, Any] | None = None
+    if requested.isdigit():
+        index = int(requested) - 1
+        if 0 <= index < len(models):
+            selected = models[index]
+    else:
+        lowered = requested.casefold()
+        exact = [
+            item
+            for item in models
+            if lowered in {str(item["id"]).casefold(), str(item["name"]).casefold()}
+        ]
+        partial = [
+            item
+            for item in models
+            if lowered and (
+                lowered in str(item["id"]).casefold()
+                or lowered in str(item["name"]).casefold()
+            )
+        ]
+        matches = exact or partial
+        if len(matches) == 1:
+            selected = matches[0]
+    if selected is None:
+        raise gr.Error(
+            f"没有唯一匹配的 SVCVC MSST 模型: {requested or '(空)'}；"
+            f"可用模型: {', '.join(item['id'] for item in models)}"
+        )
+
+    with GPU_JOB_LOCK:
+        CONFIG.setdefault("msst", {})["model"] = selected["id"]
+        _save_config()
+    refreshed = show_msst_models()
+    print(
+        f"[SVCVC MSST模型切换Debug] 已切换并保存: {selected['id']} ({selected['name']})",
+        flush=True,
+    )
+    return {
+        "success": True,
+        "id": selected["id"],
+        "name": selected["name"],
+        "current": selected["id"],
+        "models": refreshed,
+    }
+
+
+def _trim_msst_stems() -> None:
+    max_entries = max(1, int(CONFIG["msst"].get("stem_cache_max_files", 20)))
+    entries = sorted(
+        (
+            path
+            for path in MSST_STEM_DIR.iterdir()
+            if path.is_dir() and not path.name.startswith(".work_")
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in entries[max_entries:]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def _separate_target_with_msst(
+    target_path: Path,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> tuple[Path, Path, dict[str, Any], bool]:
+    # clear_cache("results"/"all") may have removed this nested cache directory.
+    # convert() and clear_cache() share GPU_JOB_LOCK, so recreating it here is
+    # sufficient and also repairs directories removed manually while idle.
+    MSST_STEM_DIR.mkdir(parents=True, exist_ok=True)
+    info = _msst_description()
+    payload = {
+        "target_sha256": _sha256_file(target_path),
+        "msst_digest": info["digest"],
+        "model_id": info["model_id"],
+        "settings": info["settings"],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    stem_key = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    stem_dir = MSST_STEM_DIR / stem_key
+    vocal_path = stem_dir / "vocals.wav"
+    instrumental_path = stem_dir / "other.wav"
+    if (
+        vocal_path.is_file()
+        and instrumental_path.is_file()
+        and vocal_path.stat().st_size > 0
+        and instrumental_path.stat().st_size > 0
+        and _looks_like_audio_payload(vocal_path)
+        and _looks_like_audio_payload(instrumental_path)
+    ):
+        os.utime(stem_dir, None)
+        print(f"[MSST缓存命中] {stem_key[:12]} | model={info['model_id']}", flush=True)
+        if progress_callback is not None:
+            progress_callback(1.0, "MSST 分离缓存命中，人声与伴奏已就绪")
+        return vocal_path.resolve(), instrumental_path.resolve(), info, True
+
+    work_dir = Path(tempfile.mkdtemp(prefix=".work_", dir=MSST_STEM_DIR))
+    try:
+        if progress_callback is not None:
+            progress_callback(0.02, f"MSST 正在加载 {info['model_id']} 并分离目标歌曲")
+        print(
+            "[MSST分离Debug] "
+            f"model={info['model_id']} target={target_path.name} settings={info['settings']}",
+            flush=True,
+        )
+        vocal_raw, instrumental_raw, info = separate_target(
+            target_path,
+            work_dir,
+            BASE_DIR,
+            dict(CONFIG.get("msst") or {}),
+            progress_callback=progress_callback,
+        )
+        if not _looks_like_audio_payload(vocal_raw) or not _looks_like_audio_payload(instrumental_raw):
+            raise MSSTBridgeError("MSST 输出不是有效音频")
+
+        shutil.rmtree(stem_dir, ignore_errors=True)
+        stem_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(vocal_raw, vocal_path)
+        shutil.copy2(instrumental_raw, instrumental_path)
+        os.utime(stem_dir, None)
+        _trim_msst_stems()
+        print(
+            f"[MSST分离完成Debug] vocals={vocal_path.name} other={instrumental_path.name}",
+            flush=True,
+        )
+        if progress_callback is not None:
+            progress_callback(1.0, "MSST 人声与伴奏分离完成")
+        return vocal_path.resolve(), instrumental_path.resolve(), info, False
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def _cache_key(target_path: Path, prompt: dict[str, Any], parameters: dict[str, Any]) -> str:
     payload = {
         "pipeline_version": PIPELINE_VERSION,
@@ -1122,14 +1383,19 @@ def _call_soulx(
     cfg: float,
     seed: int,
     progress_callback: Callable[[float, str], None] | None = None,
+    target_accompaniment_path: Path | None = None,
 ) -> tuple[Path, str, Path]:
     base_url = str(CONFIG["soulx"]["base_url"]).rstrip("/")
     timeout = float(CONFIG["soulx"]["request_timeout_seconds"])
-    try:
-        discovered = _discover_soulx_endpoints(base_url, timeout=5.0)
-    except Exception:
-        discovered = []
-    endpoints = discovered or list(SOULX_ENDPOINT_CANDIDATES)
+    if target_accompaniment_path is not None:
+        discovered = [SOULX_EXTERNAL_ACC_ENDPOINT]
+        endpoints = list(discovered)
+    else:
+        try:
+            discovered = _discover_soulx_endpoints(base_url, timeout=5.0)
+        except Exception:
+            discovered = []
+        endpoints = discovered or list(SOULX_ENDPOINT_CANDIDATES)
     call_download_dir = Path(tempfile.mkdtemp(prefix="call_", dir=SOULX_DOWNLOAD_DIR))
     try:
         client = Client(
@@ -1143,18 +1409,32 @@ def _call_soulx(
             httpx_kwargs={"timeout": timeout},
             download_files=call_download_dir,
         )
-        arguments = (
-            handle_file(str(prompt_path)),
-            handle_file(str(target_path)),
-            bool(prompt_vocal_sep),
-            bool(target_vocal_sep),
-            bool(auto_shift),
-            bool(auto_mix_acc),
-            int(pitch_shift),
-            int(n_step),
-            float(cfg),
-            int(seed),
-        )
+        if target_accompaniment_path is not None:
+            arguments = (
+                handle_file(str(prompt_path)),
+                handle_file(str(target_path)),
+                handle_file(str(target_accompaniment_path)),
+                bool(prompt_vocal_sep),
+                bool(auto_shift),
+                bool(auto_mix_acc),
+                int(pitch_shift),
+                int(n_step),
+                float(cfg),
+                int(seed),
+            )
+        else:
+            arguments = (
+                handle_file(str(prompt_path)),
+                handle_file(str(target_path)),
+                bool(prompt_vocal_sep),
+                bool(target_vocal_sep),
+                bool(auto_shift),
+                bool(auto_mix_acc),
+                int(pitch_shift),
+                int(n_step),
+                float(cfg),
+                int(seed),
+            )
     except Exception:
         shutil.rmtree(call_download_dir, ignore_errors=True)
         raise
@@ -1223,6 +1503,11 @@ def _call_soulx(
                 if discovered or index == len(endpoints) - 1 or not _looks_like_missing_endpoint(exc):
                     break
                 print(f"[WARN] SoulX 不支持 {endpoint}，尝试兼容端点", flush=True)
+        if target_accompaniment_path is not None and _looks_like_missing_endpoint(last_error or RuntimeError()):
+            raise RuntimeError(
+                "SoulX-Singer 尚未提供 MSST 外部伴奏接口；请同步本项目配套的 "
+                "webui_svc.py 补丁并重启 7861"
+            ) from last_error
         raise RuntimeError(f"SoulX-SVC 调用失败: {last_error}") from last_error
     except Exception:
         shutil.rmtree(call_download_dir, ignore_errors=True)
@@ -1326,6 +1611,7 @@ def convert(
     target_upload: str | None = None,
     reference_source: str = "",
     reference_upload: str | None = None,
+    target_separation: str = "",
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str, str]:
     """将目标歌曲交给 SoulX-Singer-SVC 转换，返回 (输出 MP3, 是否命中缓存)。"""
@@ -1333,6 +1619,10 @@ def convert(
     try:
         progress(0.02, desc="正在检查 SVCVC 参数与参考音色...")
         pitch_shift, n_step, cfg, seed = _validate_parameters(pitch_shift, n_step, cfg, seed)
+        separation_mode = _normalize_target_separation(target_separation, target_vocal_sep)
+        if separation_mode == "msst" and bool(auto_mix_acc):
+            progress(0.025, desc="正在检查 SoulX 外部伴奏接口...")
+            _require_soulx_external_acc_endpoint()
         requested_random = bool(random_seed) or seed == -1
         actual_seed = random.SystemRandom().randint(0, 4294967295) if seed == -1 else seed
         def source_progress(value: float, description: str) -> None:
@@ -1357,7 +1647,7 @@ def convert(
         parameters = {
             "profile_id": prompt["profile_id"],
             "prompt_vocal_sep": bool(prompt_vocal_sep),
-            "target_vocal_sep": bool(target_vocal_sep),
+            "target_separation": separation_mode,
             "auto_shift": bool(auto_shift),
             "auto_mix_acc": bool(auto_mix_acc),
             "pitch_shift": pitch_shift,
@@ -1365,6 +1655,13 @@ def convert(
             "cfg": cfg,
             "seed": actual_seed,
         }
+        if separation_mode == "msst":
+            msst_info = _msst_description()
+            parameters["msst"] = {
+                "digest": msst_info["digest"],
+                "model_id": msst_info["model_id"],
+                "settings": msst_info["settings"],
+            }
         key = _cache_key(target_path, prompt, parameters)
         cache_path = CACHE_DIR / f"{key}.mp3"
         persistent_cache = bool(CONFIG["cache"]["enabled"]) and (
@@ -1373,7 +1670,7 @@ def convert(
         print(
             "[SVCVC任务Debug] "
             f"音色={prompt['profile_id']} target={target_path.name} "
-            f"prompt_sep={bool(prompt_vocal_sep)} target_sep={bool(target_vocal_sep)} "
+            f"prompt_sep={bool(prompt_vocal_sep)} target_separation={separation_mode} "
             f"auto_shift={bool(auto_shift)} auto_mix={bool(auto_mix_acc)} "
             f"pitch={pitch_shift} steps={n_step} cfg={cfg} "
             f"seed={actual_seed} random={requested_random} cache={persistent_cache}",
@@ -1385,24 +1682,54 @@ def convert(
             progress(1.0, desc=f"缓存命中 / Cache hit，实际种子 {actual_seed}")
             return str(cache_path.resolve()), "true"
 
-        progress(0.08, desc=f"等待 SoulX GPU 队列，实际种子 {actual_seed}...")
+        progress(0.08, desc=f"等待 SVCVC GPU 队列，实际种子 {actual_seed}...")
         with GPU_JOB_LOCK:
             if persistent_cache and cache_path.is_file() and cache_path.stat().st_size > 0:
                 os.utime(cache_path, None)
                 print(f"[缓存命中] GPU 队列复查命中 {cache_path.name}", flush=True)
                 progress(1.0, desc=f"缓存命中 / Cache hit，实际种子 {actual_seed}")
                 return str(cache_path.resolve()), "true"
-            progress(0.12, desc="SoulX 正在做人声分离、F0 提取与音色转换...")
             call_download_dir: Path | None = None
             try:
+                soulx_target_path = target_path
+                soulx_target_vocal_sep = separation_mode == "soulx"
+                external_accompaniment_path: Path | None = None
+                upstream_offset = 0.12
+                upstream_span = 0.80
+
+                if separation_mode == "msst":
+                    def msst_progress(value: float, description: str) -> None:
+                        progress(0.10 + 0.22 * value, desc=description)
+
+                    soulx_target_path, msst_instrumental_path, _, stem_cache_hit = (
+                        _separate_target_with_msst(target_path, msst_progress)
+                    )
+                    soulx_target_vocal_sep = False
+                    if bool(auto_mix_acc):
+                        external_accompaniment_path = msst_instrumental_path
+                    upstream_offset = 0.34
+                    upstream_span = 0.58
+                    print(
+                        "[SVCVC分离路由Debug] "
+                        f"mode=msst stem_cache={stem_cache_hit} "
+                        f"target={soulx_target_path.name} "
+                        f"external_acc={external_accompaniment_path is not None}",
+                        flush=True,
+                    )
+                    progress(0.34, desc="MSST 人声已送入 SoulX，正在提取 F0 与转换音色...")
+                elif separation_mode == "soulx":
+                    progress(0.12, desc="SoulX 正在分离目标歌曲、提取 F0 与转换音色...")
+                else:
+                    progress(0.12, desc="目标输入按纯人声处理，SoulX 正在提取 F0 与转换音色...")
+
                 def upstream_progress(value: float, description: str) -> None:
-                    progress(0.12 + 0.80 * value, desc=description)
+                    progress(upstream_offset + upstream_span * value, desc=description)
 
                 result_path, endpoint, call_download_dir = _call_soulx(
                     prompt_path,
-                    target_path,
+                    soulx_target_path,
                     bool(prompt_vocal_sep),
-                    bool(target_vocal_sep),
+                    soulx_target_vocal_sep,
                     bool(auto_shift),
                     bool(auto_mix_acc),
                     pitch_shift,
@@ -1410,6 +1737,7 @@ def convert(
                     cfg,
                     actual_seed,
                     upstream_progress,
+                    external_accompaniment_path,
                 )
                 progress(0.95, desc="正在导出 QQ 兼容的 320 kbps MP3...")
                 if persistent_cache:
@@ -1468,9 +1796,19 @@ def build_app() -> gr.Blocks:
                     refresh_profiles = gr.Button("刷新参考音色", size="sm")
                 with gr.Row():
                     prompt_vocal_sep = gr.Checkbox(False, label="参考人声分离")
-                    target_vocal_sep = gr.Checkbox(True, label="目标人声分离")
+                    target_separation = gr.Dropdown(
+                        choices=[
+                            ("SoulX 目标歌曲人声分离", "soulx"),
+                            ("MSST 人声分离（BS-Roformer）", "msst"),
+                            ("不分离（输入已是纯人声）", "none"),
+                        ],
+                        value="soulx",
+                        label="目标歌曲人声分离方式",
+                    )
                     auto_shift = gr.Checkbox(True, label="自动变调")
                     auto_mix_acc = gr.Checkbox(True, label="自动混合伴奏")
+                # 保留旧 API 第 4 个布尔参数；新分离方式追加在参数末尾，旧插件仍可调用。
+                target_vocal_sep = gr.Checkbox(True, visible=False)
                 with gr.Row():
                     pitch_shift = gr.Slider(-36, 36, value=0, step=1, label="指定变调（半音）")
                     n_step = gr.Slider(1, 200, value=32, step=1, label="采样步数")
@@ -1485,7 +1823,7 @@ def build_app() -> gr.Blocks:
                     inputs=[
                         target_source, model_dropdown, prompt_vocal_sep, target_vocal_sep,
                         auto_shift, auto_mix_acc, pitch_shift, n_step, cfg, seed, random_seed,
-                        target_upload, reference_source, reference_upload,
+                        target_upload, reference_source, reference_upload, target_separation,
                     ],
                     outputs=[output_audio, cache_hit],
                     api_name="convert",
@@ -1560,11 +1898,22 @@ def build_app() -> gr.Blocks:
         api_profiles = gr.JSON(visible=False)
         api_health = gr.JSON(visible=False)
         api_cache = gr.JSON(visible=False)
+        api_msst_models = gr.JSON(visible=False)
+        api_msst_model_name = gr.Textbox(visible=False)
+        api_msst_selection = gr.JSON(visible=False)
         api_cache_scope = gr.Textbox(value="all", visible=False)
         app.load(fn=show_model, inputs=[], outputs=api_models, api_name="show_model")
         app.load(fn=list_voice_profiles, inputs=[], outputs=api_profiles, api_name="list_voice_profiles")
         app.load(fn=health, inputs=[], outputs=api_health, api_name="health")
         app.load(fn=cache_info, inputs=[], outputs=api_cache, api_name="cache_info")
+        app.load(fn=show_msst_models, inputs=[], outputs=api_msst_models, api_name="show_msst_models")
+        gr.Button("API Select MSST Model", visible=False).click(
+            fn=select_msst_model,
+            inputs=[api_msst_model_name],
+            outputs=[api_msst_selection],
+            api_name="select_msst_model",
+            concurrency_limit=1,
+        )
         gr.Button("API Clear Cache", visible=False).click(
             fn=clear_cache,
             inputs=[api_cache_scope],

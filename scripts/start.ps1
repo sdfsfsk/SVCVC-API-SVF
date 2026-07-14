@@ -47,6 +47,29 @@ try {
         throw "config.json server.port is invalid: $port"
     }
 
+    $msstRootValue = [string]$config.msst.root
+    if ([string]::IsNullOrWhiteSpace($msstRootValue)) { $msstRootValue = "." }
+    if ([System.IO.Path]::IsPathRooted($msstRootValue)) {
+        $msstRoot = [System.IO.Path]::GetFullPath($msstRootValue)
+    }
+    else {
+        $msstRoot = [System.IO.Path]::GetFullPath((Join-Path $root $msstRootValue))
+    }
+    $msstRequired = @(
+        (Join-Path $msstRoot "runtime-rocm\Scripts\python.exe"),
+        (Join-Path $msstRoot "msst\msst_separate.py"),
+        (Join-Path $msstRoot "msst\pretrain\vocal_models\model_bs_roformer_ep_317_sdr_12.9755.ckpt"),
+        (Join-Path $msstRoot "msst\configs\vocal_models\model_bs_roformer_ep_317_sdr_12.9755.ckpt.yaml")
+    )
+    $msstMissing = @($msstRequired | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+    if ($msstMissing.Count -eq 0) {
+        Write-Host "[INFO] Bundled MSST is ready: $msstRoot" -ForegroundColor Green
+    }
+    else {
+        Write-Host "[WARN] Bundled MSST is incomplete; SoulX/none modes remain available." -ForegroundColor Yellow
+        $msstMissing | ForEach-Object { Write-Host "       Missing: $_" -ForegroundColor Yellow }
+    }
+
     Write-Host "[INFO] Checking old SVCVC-API listener on port $port..."
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $clearPort -Port $port -ExpectedApp $app -WaitSeconds 10
     if ($LASTEXITCODE -ne 0) {

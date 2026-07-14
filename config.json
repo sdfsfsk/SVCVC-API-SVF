@@ -9,6 +9,15 @@
     "request_timeout_seconds": 9000,
     "asset_fingerprint_refresh_seconds": 5
   },
+  "msst": {
+    "root": ".",
+    "model": "bs_roformer_ep_317_sdr_12.9755",
+    "batch_size": 1,
+    "num_overlap": 4,
+    "normalize": false,
+    "use_tta": false,
+    "stem_cache_max_files": 20
+  },
   "download": {
     "timeout_seconds": 60,
     "max_size_mb": 500,

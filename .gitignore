@@ -1,4 +1,5 @@
 runtime/
+runtime-rocm/
 cache/*
 downloads/*
 outputs/*
@@ -18,3 +19,7 @@ voice_profiles/*
 # Local test/debug artifacts
 test_*
 *.log
+
+# Offline packages may include the local MSST checkpoint. Keep large weights
+# out of Git even though they remain inside the distributable folder/ZIP.
+msst/pretrain/
