@@ -33,7 +33,7 @@ from gradio_client import Client, handle_file
 
 
 APP_NAME = "SVCVC-API"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 PIPELINE_VERSION = "soulx-svcvc-v3"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("SVCVC_CONFIG", BASE_DIR / "config.json"))
@@ -999,8 +999,8 @@ def _validate_parameters(
         raise ValueError("n_step 必须在 1 到 200 之间")
     if not 0.0 <= cfg <= 10.0:
         raise ValueError("cfg 必须在 0 到 10 之间")
-    if seed != -1 and not 0 <= seed <= 10000:
-        raise ValueError("seed 必须是 -1（随机）或 0 到 10000")
+    if seed != -1 and not 0 <= seed <= 4294967295:
+        raise ValueError("seed 必须是 -1（随机）或 0 到 4294967295")
     return pitch_shift, n_step, cfg, seed
 
 
@@ -1334,7 +1334,7 @@ def convert(
         progress(0.02, desc="正在检查 SVCVC 参数与参考音色...")
         pitch_shift, n_step, cfg, seed = _validate_parameters(pitch_shift, n_step, cfg, seed)
         requested_random = bool(random_seed) or seed == -1
-        actual_seed = random.SystemRandom().randint(0, 10000) if seed == -1 else seed
+        actual_seed = random.SystemRandom().randint(0, 4294967295) if seed == -1 else seed
         def source_progress(value: float, description: str) -> None:
             progress(0.02 + 0.06 * value, desc=description)
 
@@ -1475,7 +1475,7 @@ def build_app() -> gr.Blocks:
                     pitch_shift = gr.Slider(-36, 36, value=0, step=1, label="指定变调（半音）")
                     n_step = gr.Slider(1, 200, value=32, step=1, label="采样步数")
                     cfg = gr.Slider(0, 10, value=1.0, step=0.1, label="CFG 系数")
-                    seed = gr.Slider(-1, 10000, value=42, step=1, label="种子（-1 为随机）")
+                    seed = gr.Slider(-1, 4294967295, value=42, step=1, label="种子（-1 为随机）")
                 random_seed = gr.Checkbox(False, label="随机任务（不读取/写入持久缓存）")
                 run_button = gr.Button("开始 SVC Voice Conversion", variant="primary")
                 output_audio = gr.Audio(label="转换结果", type="filepath")
